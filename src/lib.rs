@@ -40,10 +40,12 @@ use std::{ptr, slice};
 /// The reader side of a single-producer multiple-consumer append-only fixed capacity array.
 ///
 /// A `OnceArray` is normally behind `Arc` and constructed by creating a
-/// [`OnceArrayWriter`] and then cloning its `.reader()`. It can also be
-/// constructed directly from a `Vec<T>` via `From` / `Into` in cases where the
-/// data is available upfront and won't be appended but the `OnceArray` type is
-/// needed for compatibility with APIs that require it.
+/// [`OnceArrayWriter`] and then cloning its `.reader()`.
+///
+/// An owned `OnceArray<T>` is semantically identical to a `Vec<T>` but without methods to mutate it.
+/// They can be inter-converted with `From` and `Into`, which may be useful in cases like:
+///   * Constructing a `OnceArray` from a `Vec` populated upfront, to pass to an API that requires `OnceArray`.
+///   * Unwrapping the underlying `Vec` after after claiming ownership with [`Arc::into_inner`] or [`Arc::try_unwrap`].
 pub struct OnceArray<T> {
     // safety invariants:
     // * `data` and `cap` may not change
@@ -87,6 +89,18 @@ impl<T> OnceArray<T> {
         }
     }
 
+    fn into_vec(self) -> Vec<T> {
+        unsafe {
+            // SAFETY:
+            // * We have exclusive access guaranteed by self.
+            // * `self.data` and `self.cap` came from a Vec,
+            //    so can be turned back into a Vec.
+            // * `self.len` elements are properly initialized
+            let mut v = ManuallyDrop::new(self);
+            Vec::from_raw_parts(v.data, *v.len.get_mut(), v.cap)
+        }
+    }
+
     /// Returns the maximum number of elements this buffer can hold.
     ///
     /// The capacity can't change once allocated.
@@ -123,6 +137,12 @@ impl<T> Deref for OnceArray<T> {
 impl<T> From<Vec<T>> for OnceArray<T> {
     fn from(val: Vec<T>) -> Self {
         OnceArray::from_vec(val)
+    }
+}
+
+impl<T> From<OnceArray<T>> for Vec<T> {
+    fn from(v: OnceArray<T>) -> Self {
+        v.into_vec()
     }
 }
 
@@ -328,6 +348,14 @@ impl<T> From<Vec<T>> for OnceArrayWriter<T> {
     fn from(vec: Vec<T>) -> OnceArrayWriter<T> {
         OnceArrayWriter::from_vec(vec)
     }
+}
+
+#[test]
+fn test_to_from_vec() {
+    let v = OnceArray::from(vec![1, 2, 3]);
+    assert_eq!(v.as_slice(), &[1, 2, 3]);
+    let v = Vec::from(v);
+    assert_eq!(v.as_slice(), &[1, 2, 3]);
 }
 
 #[test]
