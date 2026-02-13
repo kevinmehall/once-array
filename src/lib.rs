@@ -15,8 +15,8 @@ pub struct OnceArray<T> {
     len: AtomicUsize,
 }
 
-unsafe impl<T> Send for OnceArray<T> {}
-unsafe impl<T> Sync for OnceArray<T> {}
+unsafe impl<T> Send for OnceArray<T> where T: Send {}
+unsafe impl<T> Sync for OnceArray<T> where T: Sync {}
 
 impl<T> Drop for OnceArray<T> {
     fn drop(&mut self) {
@@ -129,7 +129,7 @@ impl<T> OnceArrayWriter<T> {
         }
     }
 
-    pub fn extend_from_slice<'a>(&mut self, slice: &'a [T]) -> &'a [T] {
+    pub fn extend_from_slice<'a>(&mut self, slice: &'a [T]) -> &'a [T] where T: Copy {
         let len = self.inner.len.load(Ordering::Relaxed);
         let count = self.inner.cap.saturating_sub(len).min(slice.len());
         unsafe {
