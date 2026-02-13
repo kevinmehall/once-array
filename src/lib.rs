@@ -1,10 +1,49 @@
+//! A single-producer multiple-consumer append-only fixed capacity array.
+//!
+//! Creating a `OnceArrayWriter<T>` allocates a fixed-capacity buffer and
+//! represents exclusive access to append elements. Any number of
+//! `Arc<OnceArray<T>>` references can be created and shared across threads.
+//! These readers can access the slice of committed elements, and see new
+//! elements as they are committed by the writer without any locking.
+//!
+//! `OnceArray` serves as a building block for streaming data to multiple
+//! consumers while amortizing the cost of allocation and synchronization across
+//! chunks of many elements.
+//!
+//! # Example:
+//!
+//! ```rust
+//! use once_array::{OnceArrayWriter, OnceArray};
+//! let mut writer = OnceArrayWriter::with_capacity(1024);
+//!
+//! // Clone the reader to share it across threads.
+//! let reader1 = writer.reader().clone();
+//! let reader2 = writer.reader().clone();
+//!
+//! // Append some data to the writer.
+//! writer.try_push(42).unwrap();
+//! writer.try_push(43).unwrap();
+//!
+//! // Commit the new elements to make them visible to readers.
+//! writer.commit();
+//!
+//! assert_eq!(reader1.as_slice(), &[42, 43]);
+//! assert_eq!(reader2.as_slice(), &[42, 43]);
+//! ```
+
 use std::mem::ManuallyDrop;
 use std::ops::Deref;
 use std::sync::Arc;
 use std::sync::atomic::{AtomicUsize, Ordering};
 use std::{ptr, slice};
 
-/// A single-producer multiple-consumer append-only fixed capacity array.
+/// The reader side of a single-producer multiple-consumer append-only fixed capacity array.
+///
+/// A `OnceArray` is normally behind `Arc` and constructed by creating a
+/// [`OnceArrayWriter`] and then cloning its `.reader()`. It can also be
+/// constructed directly from a `Vec<T>` via `From` / `Into` in cases where the
+/// data is available upfront and won't be appended but the `OnceArray` type is
+/// needed for compatibility with APIs that require it.
 pub struct OnceArray<T> {
     // safety invariants:
     // * `data` and `cap` may not change
@@ -88,6 +127,22 @@ impl<T> From<Vec<T>> for OnceArray<T> {
 }
 
 /// Exclusive write access to a [`OnceArray`].
+///
+/// The `OnceArrayWriter` provides methods to append elements to the uncommitted
+/// portion of the array. The uncommitted portion is not visible to readers and
+/// can be [mutated](OnceArrayWriter::uncommitted_mut) or
+/// [discarded](OnceArrayWriter::revert) because the writer retains exclusive access.
+///
+/// Once the writer is ready to make new elements visible to readers, it can
+/// call [`commit()`](OnceArrayWriter::commit) or
+/// [`commit_partial(n)`](OnceArrayWriter::commit_partial) to make elements
+/// immutable and atomically visible to readers. As long as there is
+/// remaining capacity, the writer can continue to append and commit more elements.
+///
+/// The API is optimized for scenarios where data is written to a series of new
+/// `OnceArrayWriter` chunks as they fill, so the append APIs return a `Result`
+/// handing back the unconsumed data when full, so the caller can easily continue
+/// filling the next chunk.
 pub struct OnceArrayWriter<T> {
     // safety invariants:
     // * This is the only `OnceArrayWriter` that wraps `inner`.
@@ -199,7 +254,7 @@ impl<T> OnceArrayWriter<T> {
     /// Attempts to append elements from `src` to the array.
     ///
     /// Returns the tail of the slice that could not be written to the buffer.
-    /// If the buffer is not full, and all elements were written, this will be
+    /// If the buffer is not filled and all elements were written, this will be
     /// an empty slice.
     ///
     /// The new elements are not visible to readers until a call to `commit()`.
