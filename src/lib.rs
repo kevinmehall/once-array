@@ -2,13 +2,16 @@ use std::mem::ManuallyDrop;
 use std::ops::Deref;
 use std::sync::Arc;
 use std::sync::atomic::{AtomicUsize, Ordering};
+use std::{ptr, slice};
 
 /// A single-producer multiple-consumer append-only fixed capacity array.
 pub struct OnceArray<T> {
     // safety invariants:
-    // * data and cap may not change
-    // * len may never decrease
-    // * nothing may write to or invalidate *data..*data.add(len), because
+    // * `data` and `cap` may not change
+    // * `len` may never decrease
+    // * `len` is always less than or equal to `cap`
+    // * the first `len` elements of `data` are initialized
+    // * nothing may write to or invalidate `*data..*data.add(len)`, because
     //   another thread may have a reference to it
     data: *mut T,
     cap: usize,
@@ -54,13 +57,13 @@ impl<T> OnceArray<T> {
 
     /// Returns the current number of elements in the buffer.
     ///
-    /// This increases when the [`OnceArrayWriter`] appends to the buffer,
-    /// but can never decrease.
+    /// This increases when the [`OnceArrayWriter`] commits new elements, but
+    /// can never decrease.
     pub fn len(&self) -> usize {
         self.len.load(Ordering::Acquire)
     }
 
-    /// Obtain a slice of the written part of the buffer.
+    /// Obtain a slice of the committed part of the buffer.
     pub fn as_slice(&self) -> &[T] {
         unsafe {
             // SAFETY: This came from a vector and is properly aligned.
@@ -86,12 +89,18 @@ impl<T> From<Vec<T>> for OnceArray<T> {
 
 /// Exclusive write access to a [`OnceArray`].
 pub struct OnceArrayWriter<T> {
+    // safety invariants:
+    // * This is the only `OnceArrayWriter` that wraps `inner`.
+    // * `uncommitted_len` is greater than or equal to `inner.len`, and less than or equal to `inner.cap`.
+    // * `uncommitted_len` elements have been initialized.
     inner: Arc<OnceArray<T>>,
+    uncommitted_len: usize,
 }
 
 impl<T> OnceArrayWriter<T> {
     fn from_vec(v: Vec<T>) -> OnceArrayWriter<T> {
         Self {
+            uncommitted_len: v.len(),
             inner: Arc::new(OnceArray::from_vec(v)),
         }
     }
@@ -101,40 +110,90 @@ impl<T> OnceArrayWriter<T> {
         Self::from_vec(Vec::with_capacity(n))
     }
 
-    /// Obtain a read-only reference.
-    pub fn reader(&self) -> Arc<OnceArray<T>> {
-        self.inner.clone()
+    /// Obtain a read-only reference to the committed part of the array.
+    pub fn reader(&self) -> &Arc<OnceArray<T>> {
+        &self.inner
     }
 
     /// Returns the number of additional elements that can be written to the buffer before it is full.
     pub fn remaining_capacity(&self) -> usize {
-        self.inner.cap - self.inner.len.load(Ordering::Relaxed)
+        self.inner.cap - self.uncommitted_len
+    }
+
+    /// Obtain an immutable slice of the entire array, including committed and uncommitted parts.
+    pub fn as_slice(&self) -> &[T] {
+        unsafe {
+            // SAFETY:
+            // * the array has been initialized up to uncommitted_len
+            std::slice::from_raw_parts(self.inner.data, self.uncommitted_len)
+        }
+    }
+
+    /// Obtain a mutable slice of the uncommitted part of the array.
+    pub fn uncommitted_mut(&mut self) -> &mut [T] {
+        // SAFETY:
+        // * this is above the committed len, so these elements are not shared.
+        // * this is below the uncommitted_len, so these elements have been initialized.
+        unsafe {
+            let committed_len = self.inner.len.load(Ordering::Relaxed);
+            slice::from_raw_parts_mut(
+                self.inner.data.add(committed_len),
+                self.uncommitted_len - committed_len,
+            )
+        }
+    }
+
+    unsafe fn push_unchecked(&mut self, val: T) {
+        // SAFETY:
+        // * caller must ensure that uncommitted_len is less than capacity
+        // * uncommitted_len is greater than or equal to inner.len, so this doesn't invalidate shared slices
+        // * this has &mut exclusive access to the only `OnceArrayWriter`
+        //   wrapping `inner`, so no other thread is writing.
+        unsafe {
+            self.inner.data.add(self.uncommitted_len).write(val);
+            self.uncommitted_len += 1;
+        }
     }
 
     /// Attempts to append an element to the buffer.
     ///
-    /// If the buffer has capacity for an additional element, returns
-    /// `Ok(index)` where `index` is the index of the newly appended element. If
-    /// the buffer is full, returns `Err(val)`, returning ownership of the value
+    /// If the buffer is full, returns `Err(val)`, returning ownership of the value
     /// that could not be added.
-    pub fn try_push(&mut self, val: T) -> Result<usize, T> {
-        let len = self.inner.len.load(Ordering::Relaxed);
-        if len < self.inner.cap {
+    ///
+    /// The new element is not visible to readers until a call to `commit()`.
+    pub fn try_push(&mut self, val: T) -> Result<(), T> {
+        if self.uncommitted_len < self.inner.cap {
+            // SAFETY: checked that uncommitted_len is less than capacity
             unsafe {
-                // SAFETY:
-                // * checked that position is less than capacity so
-                //   address is in bounds.
-                // * this is above the current len so doesn't invalidate slices
-                // * this has &mut exclusive access to the only `BufferChunkWriter`
-                //   wrapping `inner`, so no other thread is writing.
-                self.inner.data.add(len).write(val);
+                self.push_unchecked(val);
             }
-
-            self.len.store(len + 1, Ordering::Release);
-            Ok(len)
+            Ok(())
         } else {
             Err(val)
         }
+    }
+
+    /// Attempts to append elements from `iter` to the buffer.
+    ///
+    /// If the buffer becomes full before `iter` is exhausted, returns
+    /// `Err(iter)`, returning ownership of the iterator. Note that if the iterator exactly fills
+    /// the remaining capacity, this will return `Err` with an empty iterator, since the `Iterator`
+    /// trait does not allow checking if an iterator is exhausted without calling `next()`.
+    ///
+    /// The new elements are not visible to readers until a call to `commit()`.
+    pub fn extend<I: IntoIterator<Item = T>>(&mut self, iter: I) -> Result<(), I::IntoIter> {
+        let mut iter = iter.into_iter();
+        while self.uncommitted_len < self.inner.cap {
+            if let Some(val) = iter.next() {
+                // SAFETY: checked that uncommitted_len is less than capacity
+                unsafe {
+                    self.push_unchecked(val);
+                }
+            } else {
+                return Ok(());
+            }
+        }
+        Err(iter)
     }
 
     /// Attempts to append elements from `src` to the array.
@@ -143,13 +202,12 @@ impl<T> OnceArrayWriter<T> {
     /// If the buffer is not full, and all elements were written, this will be
     /// an empty slice.
     ///
-    /// The new elements become visible to readers atomically.
+    /// The new elements are not visible to readers until a call to `commit()`.
     pub fn extend_from_slice<'a>(&mut self, src: &'a [T]) -> &'a [T]
     where
         T: Copy,
     {
-        let len = self.inner.len.load(Ordering::Relaxed);
-        let count = self.inner.cap.saturating_sub(len).min(src.len());
+        let count = self.remaining_capacity().min(src.len());
         unsafe {
             // SAFETY:
             // * checked that position is less than capacity so
@@ -159,20 +217,55 @@ impl<T> OnceArrayWriter<T> {
             //   wrapping `inner`, so no other thread is writing.
             self.inner
                 .data
-                .add(len)
+                .add(self.uncommitted_len)
                 .copy_from_nonoverlapping(src.as_ptr(), count);
         }
 
-        self.len.store(len + count, Ordering::Release);
+        self.uncommitted_len += count;
         &src[count..]
+    }
+
+    /// Makes newly written elements immutable and atomically visible to readers.
+    pub fn commit(&mut self) {
+        self.inner
+            .len
+            .store(self.uncommitted_len, Ordering::Release);
+    }
+
+    /// Makes the first `n` newly written elements immutable and atomically visible to readers.
+    ///
+    /// **Panics** if `n` is greater than the number of initialized but uncommitted elements.
+    pub fn commit_partial(&mut self, n: usize) {
+        let committed_len = self.inner.len.load(Ordering::Relaxed);
+        assert!(
+            n <= self.uncommitted_len - committed_len,
+            "Cannot commit more elements than have been initialized"
+        );
+        self.inner.len.store(committed_len + n, Ordering::Release);
+    }
+
+    /// Discards any uncommitted elements, reverting the buffer to the last committed state.
+    pub fn revert(&mut self) {
+        let committed_len = self.inner.len.load(Ordering::Relaxed);
+        let uncommitted_len = self.uncommitted_len;
+
+        // truncate first, in case dropping an element panics
+        self.uncommitted_len = committed_len;
+
+        // SAFETY:
+        // These elements have been initialized and are not shared.
+        unsafe {
+            ptr::drop_in_place(slice::from_raw_parts_mut(
+                self.inner.data.add(committed_len),
+                uncommitted_len - committed_len,
+            ));
+        }
     }
 }
 
-impl<T> Deref for OnceArrayWriter<T> {
-    type Target = OnceArray<T>;
-
-    fn deref(&self) -> &Self::Target {
-        &*self.inner
+impl<T> Drop for OnceArrayWriter<T> {
+    fn drop(&mut self) {
+        self.revert();
     }
 }
 
@@ -185,18 +278,21 @@ impl<T> From<Vec<T>> for OnceArrayWriter<T> {
 #[test]
 fn test_push() {
     let mut writer = OnceArrayWriter::with_capacity(4);
-    let reader = writer.reader();
+    let reader = writer.reader().clone();
     assert_eq!(reader.capacity(), 4);
     assert_eq!(reader.len(), 0);
 
-    assert_eq!(writer.try_push(1), Ok(0));
+    assert_eq!(writer.try_push(1), Ok(()));
+    assert_eq!(reader.len(), 0);
+    writer.commit();
     assert_eq!(reader.len(), 1);
     assert_eq!(reader.as_slice(), &[1]);
 
-    assert_eq!(writer.try_push(2), Ok(1));
-    assert_eq!(writer.try_push(3), Ok(2));
-    assert_eq!(writer.try_push(4), Ok(3));
+    assert_eq!(writer.try_push(2), Ok(()));
+    assert_eq!(writer.try_push(3), Ok(()));
+    assert_eq!(writer.try_push(4), Ok(()));
     assert_eq!(writer.try_push(5), Err(5));
+    writer.commit();
 
     assert_eq!(reader.len(), 4);
     assert_eq!(reader.as_slice(), &[1, 2, 3, 4]);
@@ -205,15 +301,105 @@ fn test_push() {
 #[test]
 fn test_extend_from_slice() {
     let mut writer = OnceArrayWriter::with_capacity(4);
-    let reader = writer.reader();
+    let reader = writer.reader().clone();
     assert_eq!(reader.capacity(), 4);
     assert_eq!(reader.len(), 0);
 
     assert_eq!(writer.extend_from_slice(&[1, 2]), &[]);
+    assert_eq!(reader.len(), 0);
+    writer.commit();
     assert_eq!(reader.len(), 2);
     assert_eq!(reader.as_slice(), &[1, 2]);
 
     assert_eq!(writer.extend_from_slice(&[3, 4, 5, 6]), &[5, 6]);
+    writer.commit();
     assert_eq!(reader.len(), 4);
     assert_eq!(reader.as_slice(), &[1, 2, 3, 4]);
+}
+
+#[test]
+fn test_commit_revert() {
+    let mut writer = OnceArrayWriter::with_capacity(4);
+    let reader = writer.reader().clone();
+
+    assert_eq!(writer.try_push(1), Ok(()));
+    assert_eq!(writer.try_push(2), Ok(()));
+    assert_eq!(writer.as_slice(), &[1, 2]);
+    assert_eq!(writer.uncommitted_mut(), &mut [1, 2]);
+    writer.commit();
+    assert_eq!(reader.as_slice(), &[1, 2]);
+    assert_eq!(writer.uncommitted_mut(), &mut []);
+
+    assert_eq!(writer.try_push(3), Ok(()));
+    assert_eq!(writer.try_push(4), Ok(()));
+
+    writer.revert();
+    assert_eq!(reader.as_slice(), &[1, 2]);
+    assert_eq!(writer.uncommitted_mut(), &mut []);
+
+    assert_eq!(writer.try_push(5), Ok(()));
+    assert_eq!(writer.try_push(6), Ok(()));
+    assert_eq!(writer.as_slice(), &[1, 2, 5, 6]);
+
+    writer.commit_partial(1);
+    assert_eq!(reader.as_slice(), &[1, 2, 5]);
+    assert_eq!(writer.uncommitted_mut(), &[6]);
+
+    drop(writer);
+    assert_eq!(reader.as_slice(), &[1, 2, 5]);
+}
+
+#[test]
+#[should_panic(expected = "Cannot commit more elements than have been initialized")]
+fn test_commit_partial_panic() {
+    let mut writer = OnceArrayWriter::with_capacity(4);
+    assert_eq!(writer.try_push(1), Ok(()));
+    writer.commit_partial(2);
+}
+
+#[test]
+fn test_extend() {
+    let mut writer = OnceArrayWriter::with_capacity(4);
+    let reader = writer.reader().clone();
+
+    assert!(writer.extend([1, 2, 3]).is_ok());
+    assert_eq!(writer.as_slice(), &[1, 2, 3]);
+    writer.commit();
+    assert_eq!(reader.as_slice(), &[1, 2, 3]);
+
+    let mut remainder = writer.extend([4, 5]).unwrap_err();
+    assert_eq!(writer.as_slice(), &[1, 2, 3, 4]);
+    assert_eq!(remainder.next(), Some(5));
+}
+
+#[test]
+fn test_drop() {
+    struct DropCounter<'a>(&'a AtomicUsize);
+
+    impl<'a> Drop for DropCounter<'a> {
+        fn drop(&mut self) {
+            self.0.fetch_add(1, Ordering::Relaxed);
+        }
+    }
+
+    let drop_count = &AtomicUsize::new(0);
+
+    let mut writer = OnceArrayWriter::with_capacity(4);
+    let reader = writer.reader().clone();
+
+    assert!(writer.try_push(DropCounter(drop_count)).is_ok());
+    assert!(writer.try_push(DropCounter(drop_count)).is_ok());
+    writer.commit();
+
+    assert!(writer.try_push(DropCounter(drop_count)).is_ok());
+    writer.revert();
+    assert_eq!(drop_count.load(Ordering::Relaxed), 1);
+
+    // this one won't be committed, so should be dropped when the writer is dropped
+    assert!(writer.try_push(DropCounter(drop_count)).is_ok());
+    drop(writer);
+    assert_eq!(drop_count.load(Ordering::Relaxed), 2);
+
+    drop(reader);
+    assert_eq!(drop_count.load(Ordering::Relaxed), 4);
 }
