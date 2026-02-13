@@ -1,25 +1,24 @@
 use std::mem::ManuallyDrop;
 use std::ops::Deref;
 use std::sync::Arc;
-use std::sync::atomic::{Ordering, AtomicUsize};
+use std::sync::atomic::{AtomicUsize, Ordering};
 
 /// Append-only fixed capacity vector.
-pub struct AppendArray<T> {
+pub struct OnceArray<T> {
     // safety invariants:
     // * data and cap may not change
     // * len may never decrease
     // * nothing may write to or invalidate *data..*data.add(len), because
     //   another thread may have a reference to it
-
     data: *mut T,
     cap: usize,
     len: AtomicUsize,
 }
 
-unsafe impl<T> Send for AppendArray<T> {}
-unsafe impl<T> Sync for AppendArray<T> {}
+unsafe impl<T> Send for OnceArray<T> {}
+unsafe impl<T> Sync for OnceArray<T> {}
 
-impl<T> Drop for AppendArray<T> {
+impl<T> Drop for OnceArray<T> {
     fn drop(&mut self) {
         unsafe {
             // SAFETY:
@@ -27,15 +26,19 @@ impl<T> Drop for AppendArray<T> {
             // * `self.data` and `self.capacity` came from a Vec,
             //    so can be turned back into a Vec.
             // * `self.len` elements are properly initialized
-            drop(Vec::from_raw_parts(self.data, *self.len.get_mut(), self.cap))
+            drop(Vec::from_raw_parts(
+                self.data,
+                *self.len.get_mut(),
+                self.cap,
+            ))
         }
     }
 }
 
-impl<T> AppendArray<T> {
+impl<T> OnceArray<T> {
     fn from_vec(v: Vec<T>) -> Self {
         let mut v = ManuallyDrop::new(v);
-        AppendArray {
+        OnceArray {
             data: v.as_mut_ptr(),
             cap: v.capacity(),
             len: AtomicUsize::new(v.len()),
@@ -67,7 +70,7 @@ impl<T> AppendArray<T> {
     }
 }
 
-impl<T> Deref for AppendArray<T> {
+impl<T> Deref for OnceArray<T> {
     type Target = [T];
 
     fn deref(&self) -> &Self::Target {
@@ -75,30 +78,30 @@ impl<T> Deref for AppendArray<T> {
     }
 }
 
-impl<T> From<Vec<T>> for AppendArray<T> {
+impl<T> From<Vec<T>> for OnceArray<T> {
     fn from(mut val: Vec<T>) -> Self {
         // We're not creating a BufferChunkWriter, so this is forever immutable
         val.shrink_to_fit();
-        AppendArray::from_vec(val)
+        OnceArray::from_vec(val)
     }
 }
 
-pub struct AppendArrayWriter<T> {
-    inner: Arc<AppendArray<T>>,
+pub struct OnceArrayWriter<T> {
+    inner: Arc<OnceArray<T>>,
 }
 
-impl<T> AppendArrayWriter<T> {
-    fn from_vec(v: Vec<T>) -> AppendArrayWriter<T> {
+impl<T> OnceArrayWriter<T> {
+    fn from_vec(v: Vec<T>) -> OnceArrayWriter<T> {
         Self {
-            inner: Arc::new(AppendArray::from_vec(v))
+            inner: Arc::new(OnceArray::from_vec(v)),
         }
     }
 
-    pub fn with_capacity(n: usize) -> AppendArrayWriter<T> {
+    pub fn with_capacity(n: usize) -> OnceArrayWriter<T> {
         Self::from_vec(Vec::with_capacity(n))
     }
 
-    pub fn reader(&self) -> Arc<AppendArray<T>> {
+    pub fn reader(&self) -> Arc<OnceArray<T>> {
         self.inner.clone()
     }
 
@@ -136,7 +139,10 @@ impl<T> AppendArrayWriter<T> {
             // * this is above the current len so doesn't invalidate slices
             // * this has &mut exclusive access to the only `BufferChunkWriter`
             //   wrapping `inner`, so no other thread is writing.
-            self.inner.data.add(len).copy_from_nonoverlapping(slice.as_ptr(), count);
+            self.inner
+                .data
+                .add(len)
+                .copy_from_nonoverlapping(slice.as_ptr(), count);
         }
 
         self.len.store(len + count, Ordering::Release);
@@ -144,23 +150,23 @@ impl<T> AppendArrayWriter<T> {
     }
 }
 
-impl<T> Deref for AppendArrayWriter<T> {
-    type Target = AppendArray<T>;
+impl<T> Deref for OnceArrayWriter<T> {
+    type Target = OnceArray<T>;
 
     fn deref(&self) -> &Self::Target {
         &*self.inner
     }
 }
 
-impl<T> From<Vec<T>> for AppendArrayWriter<T> {
-    fn from(vec: Vec<T>) -> AppendArrayWriter<T> {
-        AppendArrayWriter::from_vec(vec)
+impl<T> From<Vec<T>> for OnceArrayWriter<T> {
+    fn from(vec: Vec<T>) -> OnceArrayWriter<T> {
+        OnceArrayWriter::from_vec(vec)
     }
 }
 
 #[test]
 fn test_push() {
-    let mut writer = AppendArrayWriter::with_capacity(4);
+    let mut writer = OnceArrayWriter::with_capacity(4);
     let reader = writer.reader();
     assert_eq!(reader.capacity(), 4);
     assert_eq!(reader.len(), 0);
@@ -180,7 +186,7 @@ fn test_push() {
 
 #[test]
 fn test_extend_from_slice() {
-    let mut writer = AppendArrayWriter::with_capacity(4);
+    let mut writer = OnceArrayWriter::with_capacity(4);
     let reader = writer.reader();
     assert_eq!(reader.capacity(), 4);
     assert_eq!(reader.len(), 0);
