@@ -3,7 +3,7 @@ use std::ops::Deref;
 use std::sync::Arc;
 use std::sync::atomic::{AtomicUsize, Ordering};
 
-/// Append-only fixed capacity vector.
+/// A single-producer multiple-consumer append-only fixed capacity array.
 pub struct OnceArray<T> {
     // safety invariants:
     // * data and cap may not change
@@ -23,7 +23,7 @@ impl<T> Drop for OnceArray<T> {
         unsafe {
             // SAFETY:
             // * We have exclusive access guaranteed by &mut.
-            // * `self.data` and `self.capacity` came from a Vec,
+            // * `self.data` and `self.cap` came from a Vec,
             //    so can be turned back into a Vec.
             // * `self.len` elements are properly initialized
             drop(Vec::from_raw_parts(
@@ -54,7 +54,7 @@ impl<T> OnceArray<T> {
 
     /// Returns the current number of elements in the buffer.
     ///
-    /// This increases when the AppendArrayWriter appends to the buffer,
+    /// This increases when the [`OnceArrayWriter`] appends to the buffer,
     /// but can never decrease.
     pub fn len(&self) -> usize {
         self.len.load(Ordering::Acquire)
@@ -79,13 +79,12 @@ impl<T> Deref for OnceArray<T> {
 }
 
 impl<T> From<Vec<T>> for OnceArray<T> {
-    fn from(mut val: Vec<T>) -> Self {
-        // We're not creating a BufferChunkWriter, so this is forever immutable
-        val.shrink_to_fit();
+    fn from(val: Vec<T>) -> Self {
         OnceArray::from_vec(val)
     }
 }
 
+/// Exclusive write access to a [`OnceArray`].
 pub struct OnceArrayWriter<T> {
     inner: Arc<OnceArray<T>>,
 }
@@ -97,18 +96,27 @@ impl<T> OnceArrayWriter<T> {
         }
     }
 
+    /// Creates a new `OnceArrayWriter` with the specified capacity.
     pub fn with_capacity(n: usize) -> OnceArrayWriter<T> {
         Self::from_vec(Vec::with_capacity(n))
     }
 
+    /// Obtain a read-only reference.
     pub fn reader(&self) -> Arc<OnceArray<T>> {
         self.inner.clone()
     }
 
+    /// Returns the number of additional elements that can be written to the buffer before it is full.
     pub fn remaining_capacity(&self) -> usize {
         self.inner.cap - self.inner.len.load(Ordering::Relaxed)
     }
 
+    /// Attempts to append an element to the buffer.
+    ///
+    /// If the buffer has capacity for an additional element, returns
+    /// `Ok(index)` where `index` is the index of the newly appended element. If
+    /// the buffer is full, returns `Err(val)`, returning ownership of the value
+    /// that could not be added.
     pub fn try_push(&mut self, val: T) -> Result<usize, T> {
         let len = self.inner.len.load(Ordering::Relaxed);
         if len < self.inner.cap {
@@ -129,9 +137,19 @@ impl<T> OnceArrayWriter<T> {
         }
     }
 
-    pub fn extend_from_slice<'a>(&mut self, slice: &'a [T]) -> &'a [T] where T: Copy {
+    /// Attempts to append elements from `src` to the array.
+    ///
+    /// Returns the tail of the slice that could not be written to the buffer.
+    /// If the buffer is not full, and all elements were written, this will be
+    /// an empty slice.
+    ///
+    /// The new elements become visible to readers atomically.
+    pub fn extend_from_slice<'a>(&mut self, src: &'a [T]) -> &'a [T]
+    where
+        T: Copy,
+    {
         let len = self.inner.len.load(Ordering::Relaxed);
-        let count = self.inner.cap.saturating_sub(len).min(slice.len());
+        let count = self.inner.cap.saturating_sub(len).min(src.len());
         unsafe {
             // SAFETY:
             // * checked that position is less than capacity so
@@ -142,11 +160,11 @@ impl<T> OnceArrayWriter<T> {
             self.inner
                 .data
                 .add(len)
-                .copy_from_nonoverlapping(slice.as_ptr(), count);
+                .copy_from_nonoverlapping(src.as_ptr(), count);
         }
 
         self.len.store(len + count, Ordering::Release);
-        &slice[count..]
+        &src[count..]
     }
 }
 
