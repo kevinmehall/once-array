@@ -31,11 +31,15 @@
 //! assert_eq!(reader2.as_slice(), &[42, 43]);
 //! ```
 
-use std::mem::ManuallyDrop;
-use std::ops::Deref;
-use std::sync::Arc;
-use std::sync::atomic::{AtomicUsize, Ordering};
-use std::{ptr, slice};
+#![no_std]
+
+extern crate alloc;
+
+use alloc::{sync::Arc, vec::Vec};
+use core::mem::ManuallyDrop;
+use core::ops::Deref;
+use core::sync::atomic::{AtomicUsize, Ordering};
+use core::{ptr, slice};
 
 /// The reader side of a single-producer multiple-consumer append-only fixed capacity array.
 ///
@@ -121,7 +125,7 @@ impl<T> OnceArray<T> {
         unsafe {
             // SAFETY: This came from a vector and is properly aligned.
             // The part up to len is initialized, and won't change
-            std::slice::from_raw_parts(self.data, self.len())
+            slice::from_raw_parts(self.data, self.len())
         }
     }
 }
@@ -200,7 +204,7 @@ impl<T> OnceArrayWriter<T> {
         unsafe {
             // SAFETY:
             // * the array has been initialized up to uncommitted_len
-            std::slice::from_raw_parts(self.inner.data, self.uncommitted_len)
+            slice::from_raw_parts(self.inner.data, self.uncommitted_len)
         }
     }
 
@@ -352,7 +356,7 @@ impl<T> From<Vec<T>> for OnceArrayWriter<T> {
 
 #[test]
 fn test_to_from_vec() {
-    let v = OnceArray::from(vec![1, 2, 3]);
+    let v = OnceArray::from(alloc::vec![1, 2, 3]);
     assert_eq!(v.as_slice(), &[1, 2, 3]);
     let v = Vec::from(v);
     assert_eq!(v.as_slice(), &[1, 2, 3]);
