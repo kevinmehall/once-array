@@ -7,3 +7,5 @@ license = "MIT OR Apache-2.0"
 categories = ["data-structures", "concurrency", "memory-management", "no-std"]
 keywords = ["spmc", "broadcast", "lock-free"]
 description = "Append-only single-writer fixed-capacity vector that can be shared across threads and accessed as a slice"
+repository = "https://github.com/kevinmehall/once-array"
+exclude = [".github"]
