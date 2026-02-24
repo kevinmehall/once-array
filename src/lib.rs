@@ -120,6 +120,16 @@ impl<T> OnceArray<T> {
         self.len.load(Ordering::Acquire)
     }
 
+    /// Returns `true` if the buffer contains no elements.
+    pub fn is_empty(&self) -> bool {
+        self.len() == 0
+    }
+
+    /// Returns `true` if the buffer is at full capacity.
+    pub fn is_full(&self) -> bool {
+        self.len() == self.cap
+    }
+
     /// Obtain a slice of the committed part of the buffer.
     pub fn as_slice(&self) -> &[T] {
         unsafe {
@@ -134,6 +144,18 @@ impl<T> Deref for OnceArray<T> {
     type Target = [T];
 
     fn deref(&self) -> &Self::Target {
+        self.as_slice()
+    }
+}
+
+impl<T> AsRef<[T]> for OnceArray<T> {
+    fn as_ref(&self) -> &[T] {
+        self.as_slice()
+    }
+}
+
+impl<T> core::borrow::Borrow<[T]> for OnceArray<T> {
+    fn borrow(&self) -> &[T] {
         self.as_slice()
     }
 }
@@ -334,7 +356,7 @@ impl<T> OnceArrayWriter<T> {
         // SAFETY:
         // These elements have been initialized and are not shared.
         unsafe {
-            ptr::drop_in_place(slice::from_raw_parts_mut(
+            ptr::drop_in_place(ptr::slice_from_raw_parts_mut(
                 self.inner.data.add(committed_len),
                 uncommitted_len - committed_len,
             ));
