@@ -512,3 +512,28 @@ fn test_drop() {
     drop(reader);
     assert_eq!(drop_count.load(Ordering::Relaxed), 4);
 }
+
+#[test]
+fn test_concurrent_read() {
+    extern crate std;
+    use std::thread;
+
+    let mut writer = OnceArrayWriter::<usize>::with_capacity(1024);
+    let reader = writer.reader().clone();
+
+    let handle = thread::spawn(move || {
+        while reader.len() < 1024 {
+            let slice = reader.as_slice();
+            // every committed element should equal its index
+            for (i, &v) in slice.iter().enumerate() {
+                assert_eq!(v, i);
+            }
+        }
+    });
+
+    for i in 0..1024 {
+        writer.try_push(i).unwrap();
+        writer.commit();
+    }
+    handle.join().unwrap();
+}
