@@ -30,6 +30,11 @@ jobs:
           toolchain: ${{matrix.rust}}
       - name: Run tests
         run: cargo test --all
+      - name: Miri setup
+        if: matrix.rust == 'nightly'
+        run: |
+          rustup component add miri
+          cargo miri setup
       - name: Test with miri
         if: matrix.rust == 'nightly'
         run: cargo miri test --all
