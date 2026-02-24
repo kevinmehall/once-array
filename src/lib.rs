@@ -59,8 +59,8 @@ pub struct OnceArray<T> {
     // * nothing may write to or invalidate `*data..*data.add(len)`, because
     //   another thread may have a reference to it
     data: *mut T,
-    cap: usize,
     len: AtomicUsize,
+    cap: usize,
 }
 
 unsafe impl<T> Send for OnceArray<T> where T: Send {}
@@ -277,9 +277,12 @@ impl<T> OnceArrayWriter<T> {
     /// Attempts to append elements from `iter` to the buffer.
     ///
     /// If the buffer becomes full before `iter` is exhausted, returns
-    /// `Err(iter)`, returning ownership of the iterator. Note that if the iterator exactly fills
-    /// the remaining capacity, this will return `Err` with an empty iterator, since the `Iterator`
-    /// trait does not allow checking if an iterator is exhausted without calling `next()`.
+    /// `Err(iter)`, returning ownership of the iterator.
+    ///
+    /// Note that if the iterator exactly fills the remaining capacity, this
+    /// will return `Err` with an empty iterator, since the `Iterator` trait
+    /// does not allow checking if an iterator is exhausted without calling
+    /// `next()`.
     ///
     /// The new elements are not visible to readers until a call to `commit()`.
     pub fn extend<I: IntoIterator<Item = T>>(&mut self, iter: I) -> Result<(), I::IntoIter> {
@@ -314,7 +317,7 @@ impl<T> OnceArrayWriter<T> {
             // * checked that position is less than capacity so
             //   address is in bounds.
             // * this is above the current len so doesn't invalidate slices
-            // * this has &mut exclusive access to the only `BufferChunkWriter`
+            // * this has &mut exclusive access to the only `OnceArrayWriter`
             //   wrapping `inner`, so no other thread is writing.
             self.inner
                 .data
